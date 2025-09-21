@@ -7,24 +7,86 @@
 #include <string.h>
 #include <arpa/inet.h>
 #include <pcap/pcap.h>
+#include <sodium.h> 
 
 #include <rte_eal.h>
 #include <rte_mempool.h>
 #include <rte_mbuf.h>
 
 #include "rte_wg.h"
+#include "noise.h"
 
 
 #define NB_MBUF 1024
 
-char *server_pubkey = "5KhJ21Og8zKXcj350DFOJQ/FZgR/HqIJFVRPFODkbAg=";
-char *server_privkey = "YIZaR9jZP/0HRTc0ROidcWnega5+i3doUyVXpYqSvnw=";
+const char* server_pubkey = "5KhJ21Og8zKXcj350DFOJQ/FZgR/HqIJFVRPFODkbAg=";
+const char* server_privkey = "YIZaR9jZP/0HRTc0ROidcWnega5+i3doUyVXpYqSvnw=";
 
-void packet_handler(u_char *user, const struct pcap_pkthdr *h, const u_char *bytes) {
-    printf("Packet captured: %d bytes\n", h->len);
+uint8_t server_privkey_bin[32];
+uint8_t server_pubkey_bin[32];
+
+int decode_base64_key(const char *base64_input, uint8_t *output, size_t output_size) {
+    // Try all possible variant values
+    if (sodium_base642bin(output, output_size, base64_input, strlen(base64_input),
+                            NULL, NULL, NULL, sodium_base64_VARIANT_ORIGINAL) == 0) {
+        return 0;
+    }
+    return -1;
 }
 
-main(int argc, char **argv)
+void packet_handler(u_char *user, const struct pcap_pkthdr *h, const u_char *bytes) {
+    uint8_t out_pkt[512];
+    
+    printf("Packet captured: %d bytes\n", h->len);
+
+    struct rte_wg_handshake wg_handshake;
+
+    int ret = rte_wg_noise_handshake_consume_initiation(
+        bytes+42, h->len-42,  // Skip Ethernet+IP+UDP headers
+        server_privkey_bin, server_pubkey_bin,
+        NULL, 0,
+        &wg_handshake);
+
+    if(ret != 0) {
+        printf("Handshake processing failed\n");
+        //return;
+    }
+
+    printf("Handshake processed. Derived keys:\n");
+    printf("Sender Index: %u\n", wg_handshake.sender_index);
+    printf("Initiator Ephemeral: ");
+    for (int i = 0; i < 32; i++) {
+        printf("%02x", wg_handshake.initiator_ephemeral[i]);
+    }
+    printf("\n");
+    printf("Initiator Static: ");
+    for (int i = 0; i < 32; i++) {
+        printf("%02x", wg_handshake.initiator_static[i]);
+    }
+    printf("\n");
+    printf("CK: ");
+    for (int i = 0; i < RTE_WG_HASH_LEN; i++) {
+        printf("%02x", wg_handshake.ck[i]);
+    }
+    printf("\n");
+    printf("H: ");
+    for (int i = 0; i < RTE_WG_HASH_LEN; i++) {
+        printf("%02x", wg_handshake.h[i]);
+    }
+    printf("\n");
+    printf("K_ENC: ");
+    for (int i = 0; i < RTE_WG_KEY_LEN; i++) {
+        printf("%02x", wg_handshake.k_enc[i]);
+    }
+    printf("\n");
+    printf("K_DEC: ");
+    for (int i = 0; i < RTE_WG_KEY_LEN; i++) {
+        printf("%02x", wg_handshake.k_dec[i]);
+    }
+    printf("\n");
+}
+
+int main(int argc, char **argv)
 {
     int ret;
 
@@ -32,6 +94,30 @@ main(int argc, char **argv)
     ret = rte_eal_init(argc, argv);
     if (ret < 0) {
         rte_panic("Cannot init EAL\n");
+    }
+
+    rte_wg_noise_init();
+
+    printf("Decoding base64 keys...\n");
+
+    if (decode_base64_key(server_pubkey, server_pubkey_bin, 32) == 0) {
+        printf("Server public key decoded successfully! Key: ");
+        for(int i=0; i<32; i++) {
+            printf("%02x", server_pubkey_bin[i]);
+        }
+        printf("\n");
+    } else {
+        printf("Failed to decode key with any variant\n");
+    }
+
+    if (decode_base64_key(server_privkey, server_privkey_bin, 32) == 0) {
+        printf("Server private key decoded successfully! Key: ");
+        for(int i=0; i<32; i++) {
+            printf("%02x", server_privkey_bin[i]);
+        }
+        printf("\n");
+    } else {
+        printf("Failed to decode key with any variant\n");
     }
 
     /* Create mempool */
@@ -94,9 +180,7 @@ main(int argc, char **argv)
     //     printf("Packet attached to peer=%p (ctx peer=%p)\n", attached, peer);
     // }
 
-    /* Cleanup */
-    rte_wg_ctx_destroy(ctx);
-    rte_mempool_free(mp);
+
 
     char errbuf[PCAP_ERRBUF_SIZE];
     pcap_t *handle = pcap_open_live("dummy0", BUFSIZ, 1, 1000, errbuf);
@@ -108,6 +192,10 @@ main(int argc, char **argv)
     
     pcap_loop(handle, 0, packet_handler, NULL);
     pcap_close(handle);
+
+    /* Cleanup */
+    rte_wg_ctx_destroy(ctx);
+    rte_mempool_free(mp);
 
     return 0;
 }

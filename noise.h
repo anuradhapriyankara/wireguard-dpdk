@@ -11,13 +11,45 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define RTE_WG_NOISE_PUBKEY_LEN 32
-#define RTE_WG_NOISE_PRIVKEY_LEN 32
-#define RTE_WG_NOISE_SYMM_KEY_LEN 32  /* AEAD key length */
-#define RTE_WG_NOISE_MAX_HANDSHAKE_MSG 512
-#define RTE_WG_HASH_LEN   32
-#define RTE_WG_KEY_LEN    32
-#define RTE_WG_MAC_LEN    16
+/* Sizes (WireGuard/kernel constants) */
+#define RTE_WG_HASH_LEN 32    /* BLAKE2s hash size */
+#define RTE_WG_KEY_LEN 32
+#define RTE_WG_MAC_LEN 16
+#define BLAKE2S_BLOCK_SIZE 64
+#define BLAKE2S_HASH_SIZE 32
+
+enum noise_lengths {
+	NOISE_PUBLIC_KEY_LEN = 32,//CURVE25519_KEY_SIZE,
+	NOISE_SYMMETRIC_KEY_LEN = 32,//CHACHA20POLY1305_KEY_SIZE,
+	NOISE_TIMESTAMP_LEN = sizeof(uint64_t) + sizeof(uint32_t),
+	NOISE_AUTHTAG_LEN = 16,//CHACHA20POLY1305_AUTHTAG_SIZE,
+	NOISE_HASH_LEN = 32//BLAKE2S_HASH_SIZE
+};
+
+#define noise_encrypted_len(plain_len) ((plain_len) + NOISE_AUTHTAG_LEN)
+
+/* Handshake result struct filled by the function */
+struct rte_wg_handshake {
+    uint32_t sender_index;
+    uint8_t initiator_ephemeral[32];
+    uint8_t initiator_static[32];
+    uint8_t ck[RTE_WG_HASH_LEN];
+    uint8_t h[RTE_WG_HASH_LEN];
+    uint8_t k_enc[RTE_WG_KEY_LEN];
+    uint8_t k_dec[RTE_WG_KEY_LEN];
+};
+
+/* WireGuard handshake initiation header */
+struct __attribute__((packed))wg_init_hdr {
+    uint8_t type;
+    uint8_t reserved_zero[3];
+    uint32_t sender_index;
+    uint8_t ephemeral[NOISE_PUBLIC_KEY_LEN];
+    uint8_t enc_static[noise_encrypted_len(NOISE_PUBLIC_KEY_LEN)];
+    uint8_t enc_ts[noise_encrypted_len(NOISE_TIMESTAMP_LEN)];
+    uint8_t mac1[16];
+    uint8_t mac2[16];
+};
 
 #ifdef __cplusplus
 extern "C" {
@@ -26,68 +58,23 @@ extern "C" {
 /* initialize libsodium; call once at startup from control-plane */
 int rte_wg_noise_init(void);
 
-/* Generate static long-term keypair (Curve25519)
- * pub and priv must be 32 bytes buffers.
- */
-int rte_wg_noise_keypair_generate(uint8_t pub[RTE_WG_NOISE_PUBKEY_LEN],
-                                  uint8_t priv[RTE_WG_NOISE_PRIVKEY_LEN]);
-
-/* Derive raw shared secret via X25519:
- * shared = X25519(priv, peer_pub)   (32 bytes)
- */
-int rte_wg_noise_shared_secret(uint8_t shared[32],
-                               const uint8_t priv[32],
-                               const uint8_t peer_pub[32]);
-
-/* Create a handshake initiation message (initiator -> responder).
- * - init_static_priv / init_static_pub: initiator static keypair (long-term).
- * - resp_static_pub: responder static public key (must be known).
- * - out_msg: buffer to receive handshake message bytes; out_len returns length.
+/*
+ * Main function: consume initiation (responder side)
  *
- * The message format is simplified: [eph_pub (32)] [enc_static_ephemeral...].
- * For testing, we encrypt a small payload (timestamp or random) using AEAD with
- * ephemeral-derived key.
- */
-int rte_wg_noise_create_initiation(const uint8_t init_static_priv[32],
-                                   const uint8_t init_static_pub[32],
-                                   const uint8_t resp_static_pub[32],
-                                   uint8_t *out_msg, size_t *out_len);
-
-/* Consume an initiation on responder side, produce response message and derived
- * shared secrets:
- * - resp_static_priv: responder long-term private key
- * - in_msg: incoming initiation
- * - out_msg: response message to send back to initiator
- * - out_len: length of response message
- * - out_rx_key, out_tx_key: 32-byte symmetric AEAD keys to install into dataplane
- * - out_rx_index, out_tx_index: indexes (32-bit) to be used by dataplane
+ * - msg/msg_len: received handshake initiation bytes
+ * - resp_static_priv/resp_static_pub: responder static keypair (32 bytes each)
+ * - cookie_secret: optional pointer to 16-byte cookie secret for mac2 verification; pass NULL if not used
+ * - cookie_len: length of cookie_secret (must be >= 16 if provided)
+ * - out: filled on success
  *
- * Note: out_rx_key is the key that the responder will use to decrypt traffic
- *       that the initiator will send (and vice versa).
+ * Returns 0 on success, -1 on error.
  */
-int rte_wg_noise_consume_initiation_and_create_response(
-    const uint8_t resp_static_priv[32],
-    const uint8_t resp_static_pub[32], /* optional, used in KDF */
-    const uint8_t *in_msg, size_t in_len,
-    uint8_t *out_msg, size_t *out_len,
-    uint8_t out_rx_key[32], uint8_t out_tx_key[32],
-    uint32_t *out_rx_index, uint32_t *out_tx_index);
-
-/* Consume a response on initiator side:
- * - init_static_priv: initiator static private key
- * - in_msg: incoming response (from responder)
- * - out_rx_key/out_tx_key: session keys to install into dataplane
- * - out_rx_index/out_tx_index: receiver indices to install
- */
-int rte_wg_noise_consume_response_and_derive_keys(
-    const uint8_t init_static_priv[32],
-    const uint8_t init_static_pub[32],
-    const uint8_t *in_msg, size_t in_len,
-    uint8_t out_rx_key[32], uint8_t out_tx_key[32],
-    uint32_t *out_rx_index, uint32_t *out_tx_index);
-
-/* Utility: generate random receiver index (non-zero) */
-uint32_t rte_wg_noise_generate_receiver_index(void);
+int
+rte_wg_noise_handshake_consume_initiation(
+    const uint8_t *msg, size_t msg_len,
+    const uint8_t resp_static_priv[32], const uint8_t resp_static_pub[32],
+    const uint8_t *cookie_secret, size_t cookie_len,
+    struct rte_wg_handshake *out);
 
 #ifdef __cplusplus
 }
