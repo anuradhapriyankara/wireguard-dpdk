@@ -49,7 +49,7 @@ void packet_handler(u_char *user, const struct pcap_pkthdr *h, const u_char *byt
 
     if(ret != 0) {
         printf("Handshake processing failed\n");
-        //return;
+        return;
     }
 
     printf("Handshake processed. Derived keys:\n");

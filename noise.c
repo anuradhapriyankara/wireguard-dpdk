@@ -21,6 +21,13 @@ enum { COOKIE_KEY_LABEL_LEN = 8 };
 static const uint8_t mac1_key_label[COOKIE_KEY_LABEL_LEN]   = "mac1----";
 static const uint8_t cookie_key_label[COOKIE_KEY_LABEL_LEN] = "cookie--";
 
+/* handshake_name and prologue used by kernel: use exact constants to match kernel */
+const uint8_t handshake_name[37] = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s";
+const uint8_t identifier_name[34] = "WireGuard v1 zx2c4 Jason@zx2c4.com";
+uint8_t handshake_init_hash[NOISE_HASH_LEN];
+uint8_t handshake_init_chaining_key[NOISE_HASH_LEN];
+
+
 void print_hex(const char *label, const uint8_t *data, size_t len)
 {
     printf("%s: ", label);
@@ -30,15 +37,6 @@ void print_hex(const char *label, const uint8_t *data, size_t len)
     printf("\n");
 }   
 
-int rte_wg_noise_init(void)
-{
-    if (sodium_init() < 0) {
-        return -1;
-    }
-    return 0;
-}
-
-
 /* ---------------- Blake2s helpers ---------------- */
 
 static void blake2s_hash(uint8_t *out, size_t outlen,
@@ -46,36 +44,63 @@ static void blake2s_hash(uint8_t *out, size_t outlen,
                          const uint8_t *key, size_t keylen)
 {
     blake2s_state S;
-    if (key && keylen > 0)
-        blake2s_init_key(&S, outlen, key, keylen);
-    else
-        blake2s_init(&S, outlen);
+    blake2s_init(&S, outlen);
+    if(key && keylen > 0)
+        blake2s_update(&S, key, keylen);
     if (in && inlen > 0)
         blake2s_update(&S, in, inlen);
     blake2s_final(&S, out, outlen);
 }
 
+int rte_wg_noise_init(void)
+{
+    if (sodium_init() < 0) {
+        return -1;
+    }
+
+    /* ck = HASH(handshake_name) */
+    blake2s_hash(handshake_init_chaining_key, NOISE_HASH_LEN,
+                               handshake_name, sizeof(handshake_name),
+                               NULL, 0);
+
+    /* h = HASH(ck || identifier_name) */
+    /*Confirmed identical outputs with kernel code*/
+    {
+        blake2s_state st;
+        blake2s_init(&st, NOISE_HASH_LEN);
+        blake2s_update(&st, handshake_init_chaining_key, NOISE_HASH_LEN);
+        blake2s_update(&st, identifier_name, sizeof(identifier_name));
+        blake2s_final(&st, handshake_init_hash, NOISE_HASH_LEN);
+
+    }
+    return 0;
+}
+
 /* HMAC-like construction with BLAKE2s */
+/*Function verified with kernel code*/
 static void
 hmac_blake2s(uint8_t out[BLAKE2S_HASH_SIZE],
              const uint8_t *in, size_t inlen,
              const uint8_t *key, size_t keylen)
 {
-    uint8_t x_key[BLAKE2S_BLOCK_SIZE];
+    uint8_t x_key[BLAKE2S_BLOCK_SIZE]; //May need aligning?
     uint8_t i_hash[BLAKE2S_HASH_SIZE];
 
-    memset(x_key, 0, sizeof(x_key));
-
+    memset(x_key, 0, sizeof(x_key)); //Done at initialization on kernel code
+    blake2s_state st;
     if (keylen > BLAKE2S_BLOCK_SIZE) {
-        blake2s_hash(x_key, BLAKE2S_HASH_SIZE, key, keylen, NULL, 0);
+        //blake2s_hash(x_key, BLAKE2S_HASH_SIZE, key, keylen, NULL, 0); // Done with 3 Step blake hash on kernel code
+        blake2s_init(&st, BLAKE2S_HASH_SIZE); //New blake2s hash state created, on the kernel code it is reused
+        blake2s_update(&st, key, keylen);
+        blake2s_final(&st, x_key, BLAKE2S_HASH_SIZE);
     } else {
         memcpy(x_key, key, keylen);
     }
 
-    for (size_t i = 0; i < BLAKE2S_BLOCK_SIZE; ++i) x_key[i] ^= 0x36;
+    for (size_t i = 0; i < BLAKE2S_BLOCK_SIZE; ++i) x_key[i] ^= 0x36; //XOR Operation, same a kernel code
 
     /* inner = BLAKE2s(ipad || in) */
-    blake2s_state st;
+    //blake2s_state st; //New blake2s hash state created, on the kernel code it is reused from previous step
     blake2s_init(&st, BLAKE2S_HASH_SIZE);
     blake2s_update(&st, x_key, BLAKE2S_BLOCK_SIZE);
     if (in && inlen) blake2s_update(&st, in, inlen);
@@ -97,13 +122,15 @@ hmac_blake2s(uint8_t out[BLAKE2S_HASH_SIZE],
 }
 
 /* HKDF-like KDF with BLAKE2s */
+//kdf_blake2s(tmp_ck, NULL, NULL, out->initiator_ephemeral, 32, chaining_key);
+/*Function verified with kernel code*/
 static void
 kdf_blake2s(uint8_t *out1, uint8_t *out2, uint8_t *out3,
             const uint8_t *data, size_t data_len,
             const uint8_t chaining_key[RTE_WG_HASH_LEN])
 {
     uint8_t secret[BLAKE2S_HASH_SIZE];
-    uint8_t tmp[BLAKE2S_HASH_SIZE + 1];
+    uint8_t tmp[BLAKE2S_HASH_SIZE + 1]; //Output buffer
 
     hmac_blake2s(secret, data, data_len, chaining_key, RTE_WG_HASH_LEN);
 
@@ -112,7 +139,7 @@ kdf_blake2s(uint8_t *out1, uint8_t *out2, uint8_t *out3,
     if (out1) memcpy(out1, tmp, RTE_WG_KEY_LEN);
 
     if (out2) {
-        memcpy(tmp, out1, RTE_WG_KEY_LEN);
+        memcpy(tmp, out1, RTE_WG_KEY_LEN); //Why do this?
         tmp[RTE_WG_KEY_LEN] = 2;
         hmac_blake2s(tmp, tmp, RTE_WG_KEY_LEN + 1, secret, BLAKE2S_HASH_SIZE);
         memcpy(out2, tmp, RTE_WG_KEY_LEN);
@@ -131,17 +158,19 @@ kdf_blake2s(uint8_t *out1, uint8_t *out2, uint8_t *out3,
 }
 
 /* mix_hash = HASH(h || src) */
+/*Function verified with kernel code*/
 static void
-mix_hash(uint8_t hash[RTE_WG_HASH_LEN], const uint8_t *src, size_t src_len)
+mix_hash(uint8_t hash[NOISE_HASH_LEN], const uint8_t *src, size_t src_len)
 {
     blake2s_state st;
-    blake2s_init(&st, RTE_WG_HASH_LEN);
-    blake2s_update(&st, hash, RTE_WG_HASH_LEN);
+    blake2s_init(&st, NOISE_HASH_LEN);
+    blake2s_update(&st, hash, NOISE_HASH_LEN);
     blake2s_update(&st, src, src_len);
-    blake2s_final(&st, hash, RTE_WG_HASH_LEN);
+    blake2s_final(&st, hash, NOISE_HASH_LEN);
 }
 
 /* mix_dh: perform X25519(private, public) -> dh; then kdf(chaining_key, dh) to update ck and produce key */
+/*Checked with kernel code*/
 static int
 mix_dh(uint8_t chaining_key[RTE_WG_HASH_LEN],
        uint8_t key[RTE_WG_KEY_LEN],
@@ -161,6 +190,27 @@ mix_dh(uint8_t chaining_key[RTE_WG_HASH_LEN],
     memcpy(chaining_key, new_ck, RTE_WG_HASH_LEN);
     memcpy(key, out_key, RTE_WG_KEY_LEN);
     sodium_memzero(dh, sizeof(dh));
+    sodium_memzero(new_ck, sizeof(new_ck));
+    sodium_memzero(out_key, sizeof(out_key));
+    return 0;
+}
+
+/* mix_dh: perform X25519(private, public) -> dh; then kdf(chaining_key, dh) to update ck and produce key */
+/*Checked with kernel code*/
+static int
+mix_precomputed_dh(uint8_t chaining_key[RTE_WG_HASH_LEN],
+       uint8_t key[RTE_WG_KEY_LEN],
+       const uint8_t private[32],
+       const uint8_t public[32])
+{
+    /* kdf: new_ck = kdf(chaining_key, dh) => outputs (ck, key) */
+    uint8_t new_ck[RTE_WG_HASH_LEN];
+    uint8_t out_key[RTE_WG_KEY_LEN];
+    /* Kernel performs kdf(chaining_key, dh) where secret=HMAC(ck, dh) and outputs are successive hmacs,
+     * here we use same helper to get two outputs */
+    kdf_blake2s(new_ck, out_key, NULL, private, sizeof(private), chaining_key);
+    memcpy(chaining_key, new_ck, RTE_WG_HASH_LEN);
+    memcpy(key, out_key, RTE_WG_KEY_LEN);
     sodium_memzero(new_ck, sizeof(new_ck));
     sodium_memzero(out_key, sizeof(out_key));
     return 0;
@@ -195,7 +245,7 @@ message_decrypt(uint8_t *dst_plain, size_t *dst_len,
 }
 
 /* Compute mac1 from packet and static_pub */
-int wg_compute_mac1(uint8_t mac1[RTE_WG_MAC_LEN],
+int compute_mac1(uint8_t mac1[RTE_WG_MAC_LEN],
                     const uint8_t *msg, size_t msg_len,
                     const uint8_t static_pub[NOISE_PUBLIC_KEY_LEN])
 {
@@ -205,15 +255,9 @@ int wg_compute_mac1(uint8_t mac1[RTE_WG_MAC_LEN],
     uint8_t message_mac1_key[NOISE_SYMMETRIC_KEY_LEN];
 
     /* === Step 1: Precompute per-peer key === */
-    {
-        blake2s_state S;
-        if (blake2s_init(&S, NOISE_SYMMETRIC_KEY_LEN) < 0)
-            return -1;
-
-        blake2s_update(&S, mac1_key_label, COOKIE_KEY_LABEL_LEN);
-        blake2s_update(&S, static_pub, NOISE_PUBLIC_KEY_LEN);
-        blake2s_final(&S, message_mac1_key, NOISE_SYMMETRIC_KEY_LEN);
-    }
+    blake2s_hash(message_mac1_key, NOISE_SYMMETRIC_KEY_LEN,
+                 static_pub, NOISE_PUBLIC_KEY_LEN,
+                 mac1_key_label, COOKIE_KEY_LABEL_LEN);
 
     /* === Step 2: Compute keyed BLAKE2s over message[0 .. mac1_offset) === */
     if (blake2s(mac1, msg, message_mac1_key,
@@ -291,7 +335,7 @@ rte_wg_noise_handshake_consume_initiation(
     /* verify mac1 */
     uint8_t calc1[RTE_WG_MAC_LEN];
     /*mac1 = BLAKE2s(message_without_macs, key = mac1_key) where mac1_key = BLAKE2s("mac1----", responder_static_pubkey)*/
-    wg_compute_mac1(calc1, msg, mac_area_len, resp_static_pub);
+    compute_mac1(calc1, msg, mac_area_len, resp_static_pub);
 
     if (sodium_memcmp(calc1, mac1, RTE_WG_MAC_LEN) != 0) {
     
@@ -325,52 +369,54 @@ rte_wg_noise_handshake_consume_initiation(
 
 
     /* --- handshake transcript init --- */
-    /* handshake_name and prologue used by kernel: use exact constants to match kernel */
-    const uint8_t handshake_name[] = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s";
-    const uint8_t identifier_name[] = "WireGuard v1 zx2c4 Jason@zx2c4.com";
 
-    uint8_t chaining_key[RTE_WG_HASH_LEN];
-    uint8_t h[RTE_WG_HASH_LEN];
 
-    /* ck = HASH(handshake_name) */
-    blake2s_hash(chaining_key, RTE_WG_HASH_LEN,
-                               handshake_name, sizeof(handshake_name)-1,
-                               NULL, 0);
 
-    /* h = HASH(ck || identifier_name) */
-    {
-        blake2s_state st;
-        blake2s_init(&st, RTE_WG_HASH_LEN);
-        blake2s_update(&st, chaining_key, RTE_WG_HASH_LEN);
-        blake2s_update(&st, identifier_name, sizeof(identifier_name)-1);
-        blake2s_final(&st, h, RTE_WG_HASH_LEN);
-
-    }
-
+    /* Handled by handshake_init in kernel code */
     /* mix_hash(h, initiator_ephemeral) */
-    mix_hash(h, out->initiator_ephemeral, 32);
+    mix_hash(handshake_init_hash, resp_static_pub, 32); //Use responder static pub key
+    /* End handshake_init */
+    //print_hex("h", h, NOISE_HASH_LEN);
+    //print_hex("handshake_init_chaining_key", handshake_init_chaining_key, NOISE_HASH_LEN);
 
-    /* kdf(chaining_key, ephemeral_pub) step kernel does (we implement via kdf_blake2s) */
+
+
+    /* kdf(handshake_init_chaining_key, ephemeral_pub) step kernel does (we implement via kdf_blake2s) */
+    /* Handled by message_ephemeral in kernel code */
     {
-        uint8_t tmp_ck[RTE_WG_HASH_LEN];
-        /* kernel updates chaining_key with kdf(chaining_key, ephemeral_pub) -> new ck */
-        kdf_blake2s(tmp_ck, NULL, NULL, out->initiator_ephemeral, 32, chaining_key);
-        memcpy(chaining_key, tmp_ck, RTE_WG_HASH_LEN);
+        uint8_t tmp_ck[NOISE_HASH_LEN];
+        //mix_hash step missing?
+        mix_hash(handshake_init_hash, out->initiator_ephemeral, 32);
+        /* kernel updates handshake_init_chaining_key with kdf(handshake_init_chaining_key, ephemeral_pub) -> new ck */
+        kdf_blake2s(tmp_ck, NULL, NULL, out->initiator_ephemeral, 32, handshake_init_chaining_key);
+        memcpy(handshake_init_chaining_key, tmp_ck, RTE_WG_HASH_LEN); //Copy content of tmp_ck to chaining_key
         sodium_memzero(tmp_ck, sizeof(tmp_ck));
     }
 
-    /* DH(eph_i, static_r) -> mix_dh: updates chaining_key and yields temp_k */
+    // print_hex("handshake_init_chaining_key after kdf", handshake_init_chaining_key, NOISE_HASH_LEN);
+    // print_hex("h after kdf", h, NOISE_HASH_LEN);
+
+    /*everything matches kernel code upto here*/
+
+    /* DH(eph_i, static_r) -> mix_dh: updates handshake_init_chaining_key and yields temp_k */
     uint8_t temp_k[RTE_WG_KEY_LEN];
-    if (mix_dh(chaining_key, temp_k, resp_static_priv, out->initiator_ephemeral) != 0) {
+    if (mix_dh(handshake_init_chaining_key, temp_k, resp_static_priv, out->initiator_ephemeral) != 0) {
         sodium_memzero(temp_k, sizeof(temp_k));
         printf("Error!! mix_dh failed\n");
         return -1;
     }
 
+    print_hex("temp_k", temp_k, RTE_WG_KEY_LEN);
+    print_hex("handshake_init_chaining_key", handshake_init_chaining_key, RTE_WG_HASH_LEN);
+    print_hex("h", handshake_init_hash, RTE_WG_HASH_LEN);
+
+    //All keys match kernel code upto here
+
     /* decrypt enc_static using temp_k with AAD = h and nonce=0 */
+    print_hex("enc_static", init_hdr->enc_static, sizeof(init_hdr->enc_static));
     uint8_t dec_static[32];
     size_t dec_len = 0;
-    if (message_decrypt(dec_static, &dec_len, init_hdr->enc_static, sizeof(init_hdr->enc_static), temp_k, h) != 0) {
+    if (message_decrypt(dec_static, &dec_len, init_hdr->enc_static, sizeof(init_hdr->enc_static), temp_k, handshake_init_hash) != 0) {
         sodium_memzero(temp_k, sizeof(temp_k));
         printf("Error!! decrypting enc_static failed\n");
         return -1;
@@ -380,11 +426,13 @@ rte_wg_noise_handshake_consume_initiation(
         printf("Error!! decrypting enc_static wrong length\n");
         return -1;
     }
-    memcpy(out->initiator_static, dec_static, 32);
+    memcpy(out->initiator_static, dec_static, 32); //Eventual goal is to decrypt and store the initiator static key
+
+    print_hex("Encryption key dec_static", dec_static, 32); // Initiator static public key
 
     /* mix_dh(static_i, static_r) */
     uint8_t temp_k2[RTE_WG_KEY_LEN];
-    if (mix_dh(chaining_key, temp_k2, dec_static, resp_static_priv) != 0) {
+    if (mix_dh(handshake_init_chaining_key, temp_k2, resp_static_priv, dec_static) != 0) {
         sodium_memzero(temp_k, sizeof(temp_k));
         sodium_memzero(temp_k2, sizeof(temp_k2));
         printf("Error!! mix_dh 2 failed\n");
@@ -396,24 +444,26 @@ rte_wg_noise_handshake_consume_initiation(
     /* decrypt timestamp/cookie field with temp_k2 and AAD = h */
     uint8_t dec_ts[256];
     size_t dec_ts_len = 0;
-    if (message_decrypt(dec_ts, &dec_ts_len, init_hdr->enc_ts, sizeof(init_hdr->enc_ts), temp_k2, h) != 0) {
+    if (message_decrypt(dec_ts, &dec_ts_len, init_hdr->enc_ts, sizeof(init_hdr->enc_ts), temp_k2, handshake_init_hash) != 0) {
         sodium_memzero(temp_k, sizeof(temp_k));
         sodium_memzero(temp_k2, sizeof(temp_k2));
         printf("Error!! decrypting enc_ts failed\n");
         return -1;
     }
 
+    print_hex("decrypted dec_ts", dec_ts, dec_ts_len);
+
     /* Caller should perform timestamp/replay checks based on dec_ts content if desired.
      * (kernel uses TAI64N timestamp checks) */
 
     /* Fill output ck and h */
-    memcpy(out->ck, chaining_key, RTE_WG_HASH_LEN);
-    memcpy(out->h, h, RTE_WG_HASH_LEN);
+    memcpy(out->ck, handshake_init_chaining_key, RTE_WG_HASH_LEN);
+    memcpy(out->h, handshake_init_hash, RTE_WG_HASH_LEN);
 
-    /* derive handshake symmetric keys (k_enc/k_dec) using kdf(chaining_key, NULL) -> outputs */
+    /* derive handshake symmetric keys (k_enc/k_dec) using kdf(handshake_init_chaining_key, NULL) -> outputs */
     {
         uint8_t k1[RTE_WG_KEY_LEN], k2[RTE_WG_KEY_LEN];
-        kdf_blake2s(k1, k2, NULL, NULL, 0, chaining_key);
+        kdf_blake2s(k1, k2, NULL, NULL, 0, handshake_init_chaining_key);
         /* Kernel ordering defines which is enc/dec depending on role; responder typically uses different mapping.
          * For responder: k_enc = k1, k_dec = k2 (this mapping must match create_response/consume_response usage).
          */
@@ -434,8 +484,8 @@ rte_wg_noise_handshake_consume_initiation(
     sodium_memzero(temp_k2, sizeof(temp_k2));
     sodium_memzero(dec_static, sizeof(dec_static));
     sodium_memzero(dec_ts, sizeof(dec_ts));
-    sodium_memzero(chaining_key, sizeof(chaining_key));
-    sodium_memzero(h, sizeof(h));
+    sodium_memzero(handshake_init_chaining_key, sizeof(handshake_init_chaining_key));
+    sodium_memzero(handshake_init_hash, sizeof(handshake_init_hash));
     return 0;
 }
 
