@@ -216,6 +216,15 @@ mix_precomputed_dh(uint8_t chaining_key[RTE_WG_HASH_LEN],
     return 0;
 }
 
+static void handshake_init(uint8_t chaining_key[NOISE_HASH_LEN],
+			   uint8_t hash[NOISE_HASH_LEN],
+			   const uint8_t remote_static[NOISE_PUBLIC_KEY_LEN])
+{
+	memcpy(hash, handshake_init_hash, NOISE_HASH_LEN);
+	memcpy(chaining_key, handshake_init_chaining_key, NOISE_HASH_LEN);
+	mix_hash(hash, remote_static, NOISE_PUBLIC_KEY_LEN);
+}
+
 /* message_decrypt: AEAD decrypt (ChaCha20-Poly1305 IETF) with AAD=hash, nonce=0 per Noise handshake.
  * On success, mix_hash(hash, ciphertext).
  */
@@ -242,6 +251,17 @@ message_decrypt(uint8_t *dst_plain, size_t *dst_len,
     mix_hash(hash, src_cipher, src_len);
     *dst_len = (size_t)mlen;
     return 0;
+}
+
+static void message_ephemeral(uint8_t ephemeral_dst[NOISE_PUBLIC_KEY_LEN],
+			      const uint8_t ephemeral_src[NOISE_PUBLIC_KEY_LEN],
+			      uint8_t chaining_key[NOISE_HASH_LEN],
+			      uint8_t hash[NOISE_HASH_LEN])
+{
+	if (ephemeral_dst != ephemeral_src)
+		memcpy(ephemeral_dst, ephemeral_src, NOISE_PUBLIC_KEY_LEN);
+	mix_hash(hash, ephemeral_src, NOISE_PUBLIC_KEY_LEN);
+	kdf_blake2s(chaining_key, NULL, NULL, ephemeral_src, NOISE_HASH_LEN, chaining_key);
 }
 
 /* Compute mac1 from packet and static_pub */
@@ -315,6 +335,15 @@ rte_wg_noise_handshake_consume_initiation(
     const uint8_t *cookie_secret, size_t cookie_len,
     struct rte_wg_handshake *out)
 {
+
+    uint8_t key[NOISE_SYMMETRIC_KEY_LEN];
+	uint8_t chaining_key[NOISE_HASH_LEN];
+	uint8_t hash[NOISE_HASH_LEN];
+	uint8_t s[NOISE_PUBLIC_KEY_LEN];
+	uint8_t e[NOISE_PUBLIC_KEY_LEN];
+	uint8_t t[NOISE_TIMESTAMP_LEN];
+	uint64_t initiation_consumption;
+    
     if (!msg || !resp_static_priv || !resp_static_pub || !out) return -1;
     /* minimal sanity: ephemeral(32) + enc_static_len(2) + enc_ts_len(2) + mac1(16) = 52+ */
     if (msg_len < 52) {
@@ -368,102 +397,62 @@ rte_wg_noise_handshake_consume_initiation(
     }*/ 
 
 
-    /* --- handshake transcript init --- */
-
-
 
     /* Handled by handshake_init in kernel code */
-    /* mix_hash(h, initiator_ephemeral) */
-    mix_hash(handshake_init_hash, resp_static_pub, 32); //Use responder static pub key
-    /* End handshake_init */
-    //print_hex("h", h, NOISE_HASH_LEN);
-    //print_hex("handshake_init_chaining_key", handshake_init_chaining_key, NOISE_HASH_LEN);
+    handshake_init(chaining_key, hash, resp_static_pub);
 
+    /* e */
+    message_ephemeral(e, out->initiator_ephemeral, chaining_key, hash);
 
-
-    /* kdf(handshake_init_chaining_key, ephemeral_pub) step kernel does (we implement via kdf_blake2s) */
-    /* Handled by message_ephemeral in kernel code */
-    {
-        uint8_t tmp_ck[NOISE_HASH_LEN];
-        //mix_hash step missing?
-        mix_hash(handshake_init_hash, out->initiator_ephemeral, 32);
-        /* kernel updates handshake_init_chaining_key with kdf(handshake_init_chaining_key, ephemeral_pub) -> new ck */
-        kdf_blake2s(tmp_ck, NULL, NULL, out->initiator_ephemeral, 32, handshake_init_chaining_key);
-        memcpy(handshake_init_chaining_key, tmp_ck, RTE_WG_HASH_LEN); //Copy content of tmp_ck to chaining_key
-        sodium_memzero(tmp_ck, sizeof(tmp_ck));
-    }
-
-    // print_hex("handshake_init_chaining_key after kdf", handshake_init_chaining_key, NOISE_HASH_LEN);
-    // print_hex("h after kdf", h, NOISE_HASH_LEN);
-
-    /*everything matches kernel code upto here*/
-
-    /* DH(eph_i, static_r) -> mix_dh: updates handshake_init_chaining_key and yields temp_k */
-    uint8_t temp_k[RTE_WG_KEY_LEN];
-    if (mix_dh(handshake_init_chaining_key, temp_k, resp_static_priv, out->initiator_ephemeral) != 0) {
-        sodium_memzero(temp_k, sizeof(temp_k));
+    /* es */
+    if (mix_dh(chaining_key, key, resp_static_priv, e) != 0) {
         printf("Error!! mix_dh failed\n");
         return -1;
     }
 
-    print_hex("temp_k", temp_k, RTE_WG_KEY_LEN);
-    print_hex("handshake_init_chaining_key", handshake_init_chaining_key, RTE_WG_HASH_LEN);
-    print_hex("h", handshake_init_hash, RTE_WG_HASH_LEN);
-
-    //All keys match kernel code upto here
-
     /* decrypt enc_static using temp_k with AAD = h and nonce=0 */
-    print_hex("enc_static", init_hdr->enc_static, sizeof(init_hdr->enc_static));
-    uint8_t dec_static[32];
-    size_t dec_len = 0;
-    if (message_decrypt(dec_static, &dec_len, init_hdr->enc_static, sizeof(init_hdr->enc_static), temp_k, handshake_init_hash) != 0) {
-        sodium_memzero(temp_k, sizeof(temp_k));
+    /* s */
+    size_t s_len = 0;
+    if (message_decrypt(s, &s_len, init_hdr->enc_static, sizeof(init_hdr->enc_static), key, hash) != 0) {
         printf("Error!! decrypting enc_static failed\n");
         return -1;
     }
-    if (dec_len != 32) {
-        sodium_memzero(temp_k, sizeof(temp_k));
+    if (s_len != 32) {
         printf("Error!! decrypting enc_static wrong length\n");
         return -1;
     }
-    memcpy(out->initiator_static, dec_static, 32); //Eventual goal is to decrypt and store the initiator static key
 
-    print_hex("Encryption key dec_static", dec_static, 32); // Initiator static public key
+    /* We should look for the peer in hashtable here */
+    memcpy(out->initiator_static, s, 32); //Eventual goal is to decrypt and store the initiator static key
 
-    /* mix_dh(static_i, static_r) */
-    uint8_t temp_k2[RTE_WG_KEY_LEN];
-    if (mix_dh(handshake_init_chaining_key, temp_k2, resp_static_priv, dec_static) != 0) {
-        sodium_memzero(temp_k, sizeof(temp_k));
-        sodium_memzero(temp_k2, sizeof(temp_k2));
+    /* same as mix_precomputed_dh but without precomputed key */
+    /* ss */
+    if (mix_dh(chaining_key, key, resp_static_priv, s) != 0) {
         printf("Error!! mix_dh 2 failed\n");
         return -1;
     }
 
     /* If PSK present, kernel calls mix_psk() here. Omitted unless you support PSK. */
 
+    /* {t}*/
     /* decrypt timestamp/cookie field with temp_k2 and AAD = h */
-    uint8_t dec_ts[256];
-    size_t dec_ts_len = 0;
-    if (message_decrypt(dec_ts, &dec_ts_len, init_hdr->enc_ts, sizeof(init_hdr->enc_ts), temp_k2, handshake_init_hash) != 0) {
-        sodium_memzero(temp_k, sizeof(temp_k));
-        sodium_memzero(temp_k2, sizeof(temp_k2));
+    size_t t_len = 0;
+    if (message_decrypt(t, &t_len, init_hdr->enc_ts, sizeof(init_hdr->enc_ts), key, hash) != 0) {
         printf("Error!! decrypting enc_ts failed\n");
         return -1;
     }
-
-    print_hex("decrypted dec_ts", dec_ts, dec_ts_len);
 
     /* Caller should perform timestamp/replay checks based on dec_ts content if desired.
      * (kernel uses TAI64N timestamp checks) */
 
     /* Fill output ck and h */
-    memcpy(out->ck, handshake_init_chaining_key, RTE_WG_HASH_LEN);
-    memcpy(out->h, handshake_init_hash, RTE_WG_HASH_LEN);
+    memcpy(out->ck, chaining_key, RTE_WG_HASH_LEN);
+    memcpy(out->h, hash, RTE_WG_HASH_LEN);
 
     /* derive handshake symmetric keys (k_enc/k_dec) using kdf(handshake_init_chaining_key, NULL) -> outputs */
     {
         uint8_t k1[RTE_WG_KEY_LEN], k2[RTE_WG_KEY_LEN];
-        kdf_blake2s(k1, k2, NULL, NULL, 0, handshake_init_chaining_key);
+        kdf_blake2s(k1, k2, NULL, NULL, 0, chaining_key);
         /* Kernel ordering defines which is enc/dec depending on role; responder typically uses different mapping.
          * For responder: k_enc = k1, k_dec = k2 (this mapping must match create_response/consume_response usage).
          */
@@ -480,12 +469,12 @@ rte_wg_noise_handshake_consume_initiation(
     out->sender_index = 0; /* set by caller if they parse sender_index elsewhere */
 
     /* wipe temps */
-    sodium_memzero(temp_k, sizeof(temp_k));
-    sodium_memzero(temp_k2, sizeof(temp_k2));
-    sodium_memzero(dec_static, sizeof(dec_static));
-    sodium_memzero(dec_ts, sizeof(dec_ts));
-    sodium_memzero(handshake_init_chaining_key, sizeof(handshake_init_chaining_key));
-    sodium_memzero(handshake_init_hash, sizeof(handshake_init_hash));
+    //sodium_memzero(temp_k, sizeof(temp_k));
+    sodium_memzero(key, sizeof(key));
+    sodium_memzero(s, sizeof(s));
+    sodium_memzero(t, sizeof(t));
+    sodium_memzero(chaining_key, sizeof(chaining_key));
+    sodium_memzero(hash, sizeof(hash));
     return 0;
 }
 
