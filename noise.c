@@ -14,6 +14,8 @@
 #include <inttypes.h>
 #include <stdlib.h>
 #include <blake2.h>
+#include <string.h>
+#include <endian.h>   // for htole32 (Linux/glibc)
 
 #include "noise.h"
 
@@ -35,7 +37,57 @@ void print_hex(const char *label, const uint8_t *data, size_t len)
         printf("%02x", data[i]);
     }
     printf("\n");
-}   
+} 
+
+static inline uint32_t to_le32(uint32_t v) {
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    return v;
+#else
+    return ((v & 0xff) << 24) |
+           ((v & 0xff00) << 8) |
+           ((v & 0xff0000) >> 8) |
+           ((v >> 24) & 0xff);
+#endif
+}
+
+size_t wg_resp_hdr_serialize(const struct wg_resp_hdr *hdr, uint8_t *out_buf) {
+    uint8_t *p = out_buf;
+
+    // type
+    *p++ = hdr->type;
+
+    // reserved_zero
+    memcpy(p, hdr->reserved_zero, sizeof(hdr->reserved_zero));
+    p += sizeof(hdr->reserved_zero);
+
+    // sender_index (convert to little endian)
+    uint32_t sender_le = htole32(hdr->sender_index);
+    memcpy(p, &sender_le, sizeof(sender_le));
+    p += sizeof(sender_le);
+
+    // sender_index (convert to little endian)
+    uint32_t receiver_le = htole32(hdr->receiver_index);
+    memcpy(p, &receiver_le, sizeof(receiver_le));
+    p += sizeof(receiver_le);
+
+    // ephemeral
+    memcpy(p, hdr->ephemeral, NOISE_PUBLIC_KEY_LEN);
+    p += NOISE_PUBLIC_KEY_LEN;
+
+    // encrypted_nothing
+    memcpy(p, hdr->encrypted_nothing, noise_encrypted_len(0));
+    p += noise_encrypted_len(0);
+
+    // mac1
+    memcpy(p, hdr->mac1, sizeof(hdr->mac1));
+    p += sizeof(hdr->mac1);
+
+    // mac2
+    memcpy(p, hdr->mac2, sizeof(hdr->mac2));
+    p += sizeof(hdr->mac2);
+
+    return p - out_buf; // total length written
+}
 
 /* ---------------- Blake2s helpers ---------------- */
 
@@ -169,6 +221,17 @@ mix_hash(uint8_t hash[NOISE_HASH_LEN], const uint8_t *src, size_t src_len)
     blake2s_final(&st, hash, NOISE_HASH_LEN);
 }
 
+static void mix_psk(uint8_t chaining_key[NOISE_HASH_LEN], uint8_t hash[NOISE_HASH_LEN],
+		    uint8_t key[NOISE_SYMMETRIC_KEY_LEN],
+		    const uint8_t psk[NOISE_SYMMETRIC_KEY_LEN])
+{
+	uint8_t temp_hash[NOISE_HASH_LEN];
+
+	kdf_blake2s(chaining_key, temp_hash, key, psk, NOISE_SYMMETRIC_KEY_LEN, chaining_key);
+	mix_hash(hash, temp_hash, NOISE_HASH_LEN);
+	sodium_memzero(temp_hash, NOISE_HASH_LEN);
+}
+
 /* mix_dh: perform X25519(private, public) -> dh; then kdf(chaining_key, dh) to update ck and produce key */
 /*Checked with kernel code*/
 static int
@@ -188,7 +251,9 @@ mix_dh(uint8_t chaining_key[RTE_WG_HASH_LEN],
      * here we use same helper to get two outputs */
     kdf_blake2s(new_ck, out_key, NULL, dh, sizeof(dh), chaining_key);
     memcpy(chaining_key, new_ck, RTE_WG_HASH_LEN);
-    memcpy(key, out_key, RTE_WG_KEY_LEN);
+    if (key){
+        memcpy(key, out_key, RTE_WG_KEY_LEN);
+    }
     sodium_memzero(dh, sizeof(dh));
     sodium_memzero(new_ck, sizeof(new_ck));
     sodium_memzero(out_key, sizeof(out_key));
@@ -223,6 +288,31 @@ static void handshake_init(uint8_t chaining_key[NOISE_HASH_LEN],
 	memcpy(hash, handshake_init_hash, NOISE_HASH_LEN);
 	memcpy(chaining_key, handshake_init_chaining_key, NOISE_HASH_LEN);
 	mix_hash(hash, remote_static, NOISE_PUBLIC_KEY_LEN);
+}
+
+static int message_encrypt(uint8_t *dst_ciphertext, const uint8_t *src_plaintext,
+			    size_t src_len, uint8_t key[NOISE_SYMMETRIC_KEY_LEN],
+			    uint8_t hash[NOISE_HASH_LEN])
+{
+	// chacha20poly1305_encrypt(dst_ciphertext, src_plaintext, src_len, hash,
+	// 			 NOISE_HASH_LEN,
+	// 			 0 /* Always zero for Noise_IK */, key);
+
+    unsigned long long mlen = 0;
+    uint8_t nonce[12] = {0};
+
+    if (crypto_aead_chacha20poly1305_ietf_encrypt(
+            dst_ciphertext, &mlen,
+            src_plaintext, src_len,
+            hash, NOISE_HASH_LEN,
+            NULL,
+            nonce, key) != 0) {
+        printf("Error!! encrypt failed in crypto_aead_chacha20poly1305_ietf_encrypt\n");
+        return -1;
+    }
+
+
+	mix_hash(hash, dst_ciphertext, mlen);
 }
 
 /* message_decrypt: AEAD decrypt (ChaCha20-Poly1305 IETF) with AAD=hash, nonce=0 per Noise handshake.
@@ -370,8 +460,8 @@ rte_wg_noise_handshake_consume_initiation(
     
         /* mac1 mismatch */
         printf("Error!! mac1 mismatch\n");
-        print_hex("expected mac1", mac1, RTE_WG_MAC_LEN);
-        print_hex("calculated mac1", calc1, RTE_WG_MAC_LEN);
+        // print_hex("expected mac1", mac1, RTE_WG_MAC_LEN);
+        // print_hex("calculated mac1", calc1, RTE_WG_MAC_LEN);
         return -1;
     }
     else {
@@ -446,8 +536,9 @@ rte_wg_noise_handshake_consume_initiation(
      * (kernel uses TAI64N timestamp checks) */
 
     /* Fill output ck and h */
-    memcpy(out->ck, chaining_key, RTE_WG_HASH_LEN);
-    memcpy(out->h, hash, RTE_WG_HASH_LEN);
+    memcpy(out->chaining_key, chaining_key, RTE_WG_HASH_LEN);
+    memcpy(out->hash, hash, RTE_WG_HASH_LEN);
+    memcpy(out->remote_ephemeral, e, NOISE_PUBLIC_KEY_LEN);
 
     /* derive handshake symmetric keys (k_enc/k_dec) using kdf(handshake_init_chaining_key, NULL) -> outputs */
     {
@@ -466,7 +557,8 @@ rte_wg_noise_handshake_consume_initiation(
      * In the kernel's struct message_handshake_initiation, sender index is at offset 0 (or included).
      * Our simplified parser earlier didn't extract it; if your wire format includes sender_index, extract and store it.
      */
-    out->sender_index = 0; /* set by caller if they parse sender_index elsewhere */
+    out->sender_index = init_hdr->sender_index;
+    out->state = HANDSHAKE_CONSUMED_INITIATION;
 
     /* wipe temps */
     //sodium_memzero(temp_k, sizeof(temp_k));
@@ -476,6 +568,105 @@ rte_wg_noise_handshake_consume_initiation(
     sodium_memzero(chaining_key, sizeof(chaining_key));
     sodium_memzero(hash, sizeof(hash));
     return 0;
+}
+
+int wg_noise_handshake_create_response(struct wg_resp_hdr *resp_hdr, size_t msg_len,
+    const uint8_t resp_static_priv[32], const uint8_t resp_static_pub[32],
+    const uint8_t peer_static_pub[32], const uint8_t *cookie_secret, size_t cookie_len,
+    struct rte_wg_handshake *handshake)
+{
+	uint8_t key[NOISE_SYMMETRIC_KEY_LEN];
+
+	/* We need to wait for crng _before_ taking any locks, since
+	 * curve25519_generate_secret uses get_random_bytes_wait.
+	 */
+	//wait_for_random_bytes();
+
+	// down_read(&handshake->static_identity->lock);
+	// down_write(&handshake->lock);
+
+    sodium_memzero(handshake->preshared_key, NOISE_SYMMETRIC_KEY_LEN); //PSK not supported in this example
+
+	if (handshake->state != HANDSHAKE_CONSUMED_INITIATION)
+		goto out;
+
+	resp_hdr->type = MESSAGE_HANDSHAKE_RESPONSE;
+	resp_hdr->sender_index = handshake->sender_index; /* from initiation */
+
+	/* e */
+
+    if(crypto_box_keypair(resp_hdr->ephemeral, handshake->ephemeral_private)>0){
+        printf("Error!! crypto_box_keypair failed\n");
+        goto out;
+    }
+	message_ephemeral(resp_hdr->ephemeral,
+			  resp_hdr->ephemeral, handshake->chaining_key,
+			  handshake->hash);
+
+    // print_hex("resp chaining_key", handshake->chaining_key, NOISE_HASH_LEN);
+    // print_hex("resp hash", handshake->hash, NOISE_HASH_LEN);
+
+	/* ee */
+	if (mix_dh(handshake->chaining_key, NULL, handshake->ephemeral_private,
+		    handshake->remote_ephemeral)!= 0)
+		goto out;
+    
+    print_hex("resp chaining_key after ee", handshake->chaining_key, NOISE_HASH_LEN);
+
+	/* se */
+	if (mix_dh(handshake->chaining_key, NULL, handshake->ephemeral_private,
+		    peer_static_pub)!= 0)
+		goto out;
+    
+    print_hex("resp chaining_key after se", handshake->chaining_key, NOISE_HASH_LEN);
+	/* psk */
+	mix_psk(handshake->chaining_key, handshake->hash, key,
+		handshake->preshared_key);
+        
+    print_hex("peer static pub", peer_static_pub, NOISE_PUBLIC_KEY_LEN);
+    print_hex("resp ephemeral pub", resp_hdr->ephemeral, NOISE_PUBLIC_KEY_LEN);    
+    print_hex("resp chaining_key after psk", handshake->chaining_key, NOISE_HASH_LEN);
+    print_hex("resp hash after psk", handshake->hash, NOISE_HASH_LEN);
+    print_hex("resp key after psk", key, NOISE_SYMMETRIC_KEY_LEN);
+
+	/* {} */
+	message_encrypt(resp_hdr->encrypted_nothing, NULL, 0, key, handshake->hash);
+
+	// dst->sender_index = wg_index_hashtable_insert(
+	// 	handshake->entry.peer->device->index_hashtable,
+	// 	&handshake->entry);
+    resp_hdr->sender_index = handshake->sender_index+1; //Temporary measure to avoid zero sender index
+    resp_hdr->receiver_index = handshake->sender_index; 
+
+    uint8_t resp_bytes[sizeof(struct wg_resp_hdr) - 32]; //msg_len - macs
+    // size_t resp_bytes_len = wg_resp_hdr_serialize(resp_hdr, resp_bytes);
+    
+    
+
+    memset(resp_hdr->mac2, 0, RTE_WG_MAC_LEN); //mac2 omitted for simplicity; implement if you support cookies
+    memset(resp_hdr->reserved_zero, 0, sizeof(resp_hdr->reserved_zero));
+    uint8_t mac1_tmp[RTE_WG_MAC_LEN];
+    memcpy(resp_bytes, resp_hdr, sizeof(struct wg_resp_hdr) - 32);
+    /* mac1 */
+    if (compute_mac1(mac1_tmp, resp_bytes, sizeof(struct wg_resp_hdr) - 32,
+                     peer_static_pub) != 0)
+        goto out;
+    
+   
+    memcpy(resp_hdr->mac1, mac1_tmp, RTE_WG_MAC_LEN);
+     print_hex("mac1", resp_hdr->mac1, RTE_WG_MAC_LEN);
+    /* mac2 */
+    /* mac2 omitted for simplicity; implement if you support cookies */
+
+	handshake->state = HANDSHAKE_CREATED_RESPONSE;
+	
+    return 1;
+
+out:
+	// up_write(&handshake->lock);
+	// up_read(&handshake->static_identity->lock);
+	sodium_memzero(key, NOISE_SYMMETRIC_KEY_LEN);
+	return -1;
 }
 
 /* Small test main (optional)
